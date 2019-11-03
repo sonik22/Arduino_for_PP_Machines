@@ -1,0 +1,355 @@
+#include <Adafruit_ST7789.h>
+#include <Adafruit_ST77xx.h>
+#include <Adafruit_ST7735.h>
+
+#include <gfxfont.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SPITFT_Macros.h>
+#include <Adafruit_SPITFT.h>
+
+
+#include <SPI.h>
+
+// #include <Arduino.h>
+#include <Ewma.h>
+
+#include <SimpleRotary.h>
+
+// Define encoder   Pin A, Pin B, Button Pin
+SimpleRotary rotary(A3, 3, 12);
+
+
+// Pins for TFT Screen D11=MOSI D13=SCK
+#define TFT_CS        10
+#define TFT_RST        8
+#define TFT_DC         9
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);   // Create display:
+// Color definitions
+#define BLACK    0x0000
+#define BLUE     0x001F
+#define RED      0xF800
+#define GREEN    0x07E0
+#define CYAN     0x07FF
+#define MAGENTA  0xF81F
+#define YELLOW   0xFFE0
+#define WHITE    0xFFFF
+
+// Pin Definitions
+int nozzle = 6;
+int barrel = 7;
+int buzzer = 4;
+int motor = 5;
+
+// Variables for rpm counting
+int encoderPin = 2;
+unsigned int rpm = 0;
+volatile byte pulses = 0;
+unsigned long timeold = 0;
+unsigned int pulsesperturn = 15;
+static volatile unsigned long debounce = 0;
+
+
+// Define smoothing filters
+Ewma adcFilterNozzle(0.01);   // higher number  = less smoothing
+Ewma adcFilterMain(0.01);
+Ewma adcFilterEntry(0.01);
+
+float filteredNozzle;   // smoothed thermistor data
+float filteredMain;
+float filteredEntry;
+
+bool motorState = 0;   // Motor can only run with motorState == 1
+bool motorFirstState = 0;
+
+int setTempNozzle = 0; // Degrees in Celsius
+int oldSetTempNozzle = 0;
+int setTempMain = 0;
+int setTempEntry = 0;
+
+int refreshCycle = 1000;   // Calculate and print on tft every 1000ms
+unsigned long lastMillis;
+
+// Variables for the calculation of Degrees from thermistorData
+float R1 = 1000;
+float logR2, R2;
+int T;
+int prevT = 0;
+float c1 = 1.311626646e-03, c2 = 0.8692932193e-04, c3 = 6.795256366e-07; // Steinhart-Hart and Hart Coefficients
+
+int nozzleTemp;
+int mainTemp;
+int entryTemp;
+
+
+
+void setup()
+{
+  Serial.begin(9600);
+  Serial.println("A");
+  SPI.begin();
+  Serial.println("B");
+  tft.initR(INITR_BLACKTAB);  // Initialize a ST7735S chip, black tab
+  Serial.println("C");
+  pinMode(A0, INPUT);
+  pinMode(A1, INPUT);
+  pinMode(A2, INPUT);
+  pinMode(6, OUTPUT);
+  pinMode(7, OUTPUT);
+  pinMode(4, OUTPUT);
+  pinMode(5, OUTPUT);
+  digitalWrite(7, HIGH);
+  digitalWrite(4, HIGH);
+  digitalWrite(5, HIGH);
+  digitalWrite(6, HIGH);
+
+  Serial.println("D");
+  tft.setRotation(1);
+  tft.fillScreen(ST7735_BLACK);  // Fill screen with black
+  tft.drawRect(0, 20, 53, 49, ST7735_BLUE);
+  tft.drawRect(53, 20, 53, 49, ST7735_BLUE);
+  tft.drawRect(106, 20, 54, 49, ST7735_BLUE);
+  tft.drawRect(0, 72, 80, 55, ST7735_BLUE);
+  tft.drawRect(80, 72, 80, 55, ST7735_BLUE);
+
+  tft.setTextSize(1);
+  tft.setCursor(5, 3);
+  tft.setTextColor(ST7735_BLUE, ST7735_BLACK);
+  tft.print("Extruder Controller V O.3");
+  tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
+  tft.setCursor(10, 25);
+  tft.print("Motor");
+  tft.setCursor(66, 25);
+  tft.print("Main");
+  tft.setCursor(116, 25);
+  tft.print("Nozzle");
+  tft.setCursor(5, 79);
+  tft.print("SET TEMP:");
+  tft.setCursor(88, 79);
+  tft.print("Screw RPM");
+  tft.setTextSize(1);
+  tft.setCursor(50, 98);
+  tft.print("o");
+  tft.setTextSize(2);
+  tft.setCursor(60, 100);
+  tft.print("C");
+  Serial.println("E");
+
+  attachInterrupt(0, counter, RISING);
+  delay(2000);
+
+}
+
+void loop()
+{
+  //*******Polling for Encoder input *********
+
+  byte i;
+  i = rotary.push();     // 0 = not pushed, 1 = pushed
+  if ( i == 1) {
+    motorState = ! motorState;
+  }
+
+  // ******** Check motorFirstState ***********
+  /*
+    if (setTempNozzle != 0) {
+      if (nozzleTemp > setTempNozzle && mainTemp > setTempMain && entryTemp > setTempEntry ) {
+        motorFirstState = 1;
+      }
+    }
+    else {
+      motorFirstState = 0;
+    }
+  */
+  if (motorState == 1) {
+    digitalWrite(motor, LOW);
+  }
+  else {
+    digitalWrite(motor, HIGH);
+  }
+
+  i = rotary.rotate();   // 0 = not turning, 1 = CW, 2 = CCW
+  if ( i == 1 ) {
+    setTempNozzle = setTempNozzle + 2;
+  }
+  if ( i == 2 ) {
+    setTempNozzle = setTempNozzle - 2;
+  }
+  int setTempMain = setTempNozzle * 90 / 100;   // mainTemp is = to 90% of nozzle Temp
+  int setTempEntry = setTempNozzle * 50 / 100;
+
+
+  // Serial.println(setTempNozzle);
+  if (setTempNozzle != oldSetTempNozzle) {
+    tft.setTextSize(2);
+    tft.setCursor(10, 100);
+    tft.fillRect(10, 100, 34, 20, ST7735_BLACK);
+    tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
+    tft.println(setTempNozzle);
+    oldSetTempNozzle = setTempNozzle;
+  }
+
+
+
+  // ******Getting Data from the 3 thermistors and smoothen them.*********
+
+  int raw0 = analogRead(A0);
+  filteredNozzle = adcFilterNozzle.filter(raw0);
+  int raw1 = analogRead(A1);
+  filteredMain = adcFilterMain.filter(raw1);
+  int raw2 = analogRead(A2);
+  filteredEntry = adcFilterEntry.filter(raw2);
+
+
+
+  // ******* every second update the variables **********
+
+  if (millis() - lastMillis > refreshCycle)  {
+
+    //********** irs for counting rpm *******
+
+    noInterrupts();
+    rpm = (60 * 1000 / pulsesperturn ) / (millis() - timeold) * pulses;
+    Serial.print(" pulses ");
+    Serial.print(pulses);
+
+
+    timeold = millis();
+    pulses = 0;
+    interrupts();
+    Serial.print("   rpm  ");
+    Serial.println(rpm);
+
+    //********* Calculate degree celsius from raw (smoothed) data
+
+    R2 = R1 * (1023.0 / (float)filteredNozzle - 1.0);
+    logR2 = log(R2);
+    T = (1.0 / (c1 + c2 * logR2 + c3 * logR2 * logR2 * logR2));
+    T = T - 273.15;
+    //  T = (T * 9.0)/ 5.0 + 32.0;  // uncomment this line to show Fahrenheit
+    nozzleTemp = T;
+
+    R2 = R1 * (1023.0 / (float)filteredMain - 1.0);
+    logR2 = log(R2);
+    T = (1.0 / (c1 + c2 * logR2 + c3 * logR2 * logR2 * logR2));
+    T = T - 273.15;
+    //  T = (T * 9.0)/ 5.0 + 32.0;  // uncomment this line to show Fahrenheit
+    mainTemp = T;
+
+    R2 = R1 * (1023.0 / (float)filteredEntry - 1.0);
+    logR2 = log(R2);
+    T = (1.0 / (c1 + c2 * logR2 + c3 * logR2 * logR2 * logR2));
+    T = T - 273.15;
+    //  T = (T * 9.0)/ 5.0 + 32.0;  // uncomment this line to show Fahrenheit
+    entryTemp = T;
+    //    calcData;
+    //    switchRelays;
+    //   printData;
+
+
+    //******** Switch Relays dependant the tempSettings *********
+
+
+
+    if (nozzleTemp <= setTempNozzle) {
+      digitalWrite(nozzle, LOW);
+    }
+    else {
+      digitalWrite(nozzle, HIGH);
+    }
+    if (mainTemp <= setTempMain) {
+      digitalWrite(barrel, LOW);
+    }
+    else {
+      digitalWrite(barrel, HIGH);
+    }
+
+    // ******* Print on screen **************
+
+
+    // ****** Print Nozzle Data  *******
+    int oldNozzleTemp;
+    if (nozzleTemp <= setTempNozzle) {
+      tft.setTextColor(ST7735_RED, ST7735_BLACK);
+    }
+    else {
+      tft.setTextColor(ST7735_GREEN, ST7735_BLACK);
+    }
+    if (nozzleTemp != oldNozzleTemp) {
+      tft.setTextSize(2);
+      tft.setCursor(112, 40);
+      tft.fillRect(112, 40, 47, 28, ST7735_BLACK);
+      tft.println(nozzleTemp);
+      oldNozzleTemp = nozzleTemp;
+    }
+
+    // ******** print Main Data ************
+
+
+    int oldMainTemp;
+    if (mainTemp <= setTempMain) {
+      tft.setTextColor(ST7735_RED, ST7735_BLACK);
+    }
+    else {
+      tft.setTextColor(ST7735_GREEN, ST7735_BLACK);
+    }
+    if (mainTemp != oldMainTemp) {
+      tft.setTextSize(2);
+      tft.setCursor(64, 40);
+      tft.fillRect(64, 40, 40, 20, ST7735_BLACK);
+      tft.println(mainTemp);
+      oldMainTemp = mainTemp;
+    }
+
+    // ********* print Entry Data ************
+    int oldEntryTemp;
+    if (entryTemp <= setTempEntry) {
+      tft.setTextColor(ST7735_RED, ST7735_BLACK);
+    }
+    else {
+      tft.setTextColor(ST7735_GREEN, ST7735_BLACK);
+    }
+    if (entryTemp != oldEntryTemp) {
+      tft.setTextSize(2);
+      tft.setCursor(10, 40);
+      tft.fillRect(10, 40, 40, 20, ST7735_BLACK);
+      tft.println(entryTemp);
+      oldEntryTemp = entryTemp;
+    }
+
+    // ****** Print RPM ******
+
+    int oldRpm;
+
+    if (motorFirstState = 0) {
+      tft.setTextColor(ST7735_RED, ST7735_BLACK);
+    }
+    else {
+      tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
+    }
+
+    //  if (rpm != oldRpm) {
+    tft.fillRect(100, 100, 40, 20, ST7735_BLACK);
+
+    tft.setTextSize(2);
+    tft.setTextColor(ST7735_WHITE, ST7735_BLACK);
+    tft.setCursor(100, 100);
+    tft.print(rpm);
+    //     oldRpm = rpm;
+    // }
+
+
+    lastMillis = millis();
+
+
+
+  }
+
+}
+
+void counter() {
+  if (  digitalRead (encoderPin) && (micros() - debounce > 500) && digitalRead (encoderPin) ) {
+    debounce = micros();
+    pulses++;
+  }
+  else ;
+}
